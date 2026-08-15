@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pete's EMC Test Report Analyser</title>
+<link rel="icon" type="image/png" sizes="32x32" href="assets/tile-32.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="assets/tile-192.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="assets/tile-180.png" />
+<link rel="shortcut icon" href="assets/favicon.ico" />
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>Pete&rsquo;s EMC Test Report Analyser</h1>
+  </header>
+  <main>
+    <figure class="chamber-banner">
+      <img src="assets/emc-chamber-car.jpg" alt="Vehicle on a turntable inside a full-anechoic EMC test chamber" />
+      <figcaption>Inside the chamber — the kind of test data this tool digs through for you.</figcaption>
+    </figure>
+
+    <section id="upload-section" class="card upload-hero">
+      <div class="upload-hero-drop">
+        <div id="drop-zone" class="drop-zone">
+          <p><strong>Drag &amp; drop</strong> an EMC test report PDF here, or</p>
+          <label class="file-button">
+            Choose PDF file
+            <input type="file" id="file-input" accept="application/pdf" hidden />
+          </label>
+          <p class="drop-zone-intro">Upload a PDF EMC test report and get a summary of failures and out-of-limit emissions by radio band. Everything runs locally in your browser — the PDF is never uploaded anywhere.</p>
+          <p class="hint">Large reports (500&ndash;1000+ pages) are supported. Parsing happens page-by-page and may take a few minutes for very large files.</p>
+        </div>
+
+        <div id="progress-area" class="progress-area" hidden>
+          <div class="progress-bar-track">
+            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+          <p id="progress-text">Starting…</p>
+        </div>
+
+        <div id="file-summary" class="file-summary" hidden></div>
+      </div>
+
+      <figure class="upload-hero-portrait">
+        <img src="assets/pete-portrait.jpg" alt="Pete in the EMC test lab, holding a spectrum analyzer" />
+        <figcaption>Pete, on shift in the EMC lab</figcaption>
+      </figure>
+    </section>
+
+    <section id="results-section" hidden>
+      <div class="controls-row">
+        <label class="threshold-control">
+          Flag as "marginal" when within
+          <input type="number" id="marginal-threshold" value="3" min="0" step="0.5" style="width:4em" />
+          dB of the limit
+        </label>
+        <button id="reanalyze-btn" class="secondary-btn">Re-apply</button>
+        <button id="export-summary-btn" class="secondary-btn">Export Summary Image (PNG)</button>
+        <button id="new-file-btn" class="secondary-btn">Analyze a different report</button>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab-btn active" data-tab="overview">Overview</button>
+        <button class="tab-btn" data-tab="failures">Failures</button>
+        <button class="tab-btn" data-tab="bands">Band Summary</button>
+        <button class="tab-btn" data-tab="immunity">Immunity</button>
+        <button class="tab-btn" data-tab="all">All Results</button>
+        <button class="tab-btn" data-tab="debug">Debug</button>
+      </nav>
+
+      <div id="tab-overview" class="tab-panel card active">
+        <div id="overview-stats" class="stats-grid"></div>
+        <canvas id="band-chart" height="90"></canvas>
+        <div id="standards-seen"></div>
+      </div>
+
+      <div id="tab-failures" class="tab-panel card">
+        <div class="table-toolbar">
+          <span id="failures-count"></span>
+          <button id="export-failures-csv" class="secondary-btn">Export CSV</button>
+        </div>
+        <div class="table-scroll">
+          <table id="failures-table" class="data-table">
+            <thead>
+              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Radio Band(s)</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-bands" class="tab-panel card">
+        <p class="hint">Radio-service bands with at least one measurement over the limit (or, if toggled, within the marginal threshold). Band edges are indicative reference data — see README for details.</p>
+        <label><input type="checkbox" id="include-marginal-bands" /> Include marginal results in band summary</label>
+        <div class="table-scroll">
+          <table id="bands-table" class="data-table">
+            <thead>
+              <tr><th>Radio Band</th><th>Range (MHz)</th><th>Exceedances</th><th>Worst Margin (dB)</th><th>Worst Page</th><th>Frequencies</th><th>Pages</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-immunity" class="tab-panel card">
+        <p class="hint">Immunity tests (RF/BCI/ESD/EFT/Surge/transients, etc.) don't have a frequency/limit-line model like emissions — labs report them as Compliant/Deviation (or Pass/Fail/Not performed) instead, sometimes with a functional performance class. This tab surfaces those verdicts directly, including labs that use "Deviation"/"Deviated" in place of "Fail". Coverage note: category-level results (the dashboard below, and each subsection's overall "Test result:") are captured reliably; individual sub-test table rows within a large sweep table (e.g. every BCI frequency point) are not all itemized — check the source page for full detail on a failing category.</p>
+
+        <h3>Immunity Failures</h3>
+        <p class="hint">One row per failing test category — this is the "what failed and why" summary, aggregated automatically from the dashboard and the individual result notes below.</p>
+        <div class="table-toolbar">
+          <span id="immunity-summary-count"></span>
+          <button id="export-immunity-summary-csv" class="secondary-btn">Export CSV</button>
+        </div>
+        <div class="table-scroll">
+          <table id="immunity-summary-table" class="data-table">
+            <thead>
+              <tr><th>Code</th><th>Test Category</th><th>Result</th><th>Key Finding</th><th>Pages</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <h3>Full Test Category Dashboard</h3>
+        <p class="hint">Every category from the report's front-matter "Tests to be done and results" table, if it has one (pass, fail, and informative-only).</p>
+        <div id="test-summary-wrap">
+          <div class="table-scroll">
+            <table id="test-summary-table" class="data-table">
+              <thead><tr><th>Code</th><th>Test</th><th>Result</th><th>Page</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <h3>Individual Result Notes</h3>
+        <p class="hint">Every "Result:" / "Test result:" note found, one per page/test (both pass and fail) — the raw material the summary above is built from.</p>
+        <div class="table-toolbar">
+          <span id="immunity-count"></span>
+          <button id="export-immunity-csv" class="secondary-btn">Export CSV</button>
+        </div>
+        <div class="table-scroll">
+          <table id="immunity-table" class="data-table">
+            <thead>
+              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Result</th><th>Description</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-all" class="tab-panel card">
+        <div class="table-toolbar">
+          <span id="all-count"></span>
+          <button id="export-all-csv" class="secondary-btn">Export CSV</button>
+        </div>
+        <div class="table-scroll">
+          <table id="all-table" class="data-table">
+            <thead>
+              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <button id="all-prev" class="secondary-btn">&laquo; Prev</button>
+          <span id="all-page-label"></span>
+          <button id="all-next" class="secondary-btn">Next &raquo;</button>
+        </div>
+      </div>
+
+      <div id="tab-debug" class="tab-panel card">
+        <p class="hint">Rows that contain a digit but didn't match the parser's expected patterns. Use this to sanity-check coverage or to tune <code>js/parser.js</code> for your report's exact layout.</p>
+        <div id="debug-stats"></div>
+        <div class="table-scroll">
+          <table id="debug-table" class="data-table">
+            <thead><tr><th>Page</th><th>Text</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Runs entirely client-side. Parsing is heuristic — always verify flagged failures against the source PDF page. See README for accuracy notes and how to customize the radio band table.</p>
+  </footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="js/bandData.js"></script>
+  <script src="js/parser.js"></script>
+  <script src="js/pdfExtract.js"></script>
+  <script src="js/csvExport.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

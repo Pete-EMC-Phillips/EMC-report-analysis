@@ -112,9 +112,31 @@ Bluetooth/Wi-Fi ISM band, and AM broadcast band) and 1 marginal pass.
    not all itemized individually — the category/section-level result and
    description usually tell you what you need, but check the source page
    for full point-by-point detail within a failing category.
-8. **Results UI** (`js/app.js`, `index.html`) — Overview stats + chart,
-   a Failures table, a Band Summary (the main "which bands are over the
-   limit" view), a paginated full results table, CSV export, and a Debug
+8. **JLR-EMC-CS RE 310 / CE 420 cross-check** (`js/jlrLimits.js`) — the
+   generic "Radio Band" classification in step 6 is indicative reference
+   data, not an authoritative limit. For reports assessed against
+   **JLR-EMC-CS v1.0 Amendment 4**, the app additionally cross-checks every
+   Radiated Emissions (RE 310) and Conducted Emissions (CE 420) row against
+   the *exact* limit lines in that standard (Tables 7-1 "Level 1", 7-2
+   "Level 2" and 8-2), including the frequency-dependent (log-formula)
+   bands, not just the flat ones. The numbers were transcribed from the PDF
+   using word-position table reconstruction (not plain text extraction) to
+   avoid column-misread errors, and are locked in by
+   `tests/jlrLimits.test.js`. Each matching Failures/All Results row shows
+   the applicable JLR-EMC-CS Test ID(s) (e.g. `MS-11 GSM 900`, `DB-02 TV
+   Band IV/V`) and their exact limit at that frequency; if the report's own
+   stated limit disagrees with the standard by more than 0.5 dB it's
+   flagged with a warning so you can spot a parser misread or a
+   customer-specific deviation. The **Standard** tab shows the full
+   transcribed tables for reference. This only covers RE 310 / CE 420
+   against this specific standard revision — other tests (immunity, CE 410,
+   RE 320, etc.) and other OEM standards aren't cross-checked numerically.
+9. **Results UI** (`js/app.js`, `index.html`) — Overview stats + chart
+   (including a separate RE 310 vs CE 420 failure count), a Failures tab
+   split into per-test groups (RE 310, CE 420, then anything else) each
+   sorted worst-margin-first with its own CSV export, a Band Summary (the
+   main "which radio bands are over the limit" view), a paginated full
+   results table, and a Debug
    tab that lists lines the parser couldn't confidently classify (useful
    for tuning the parser to your specific report format). An **"Export
    Summary Image (PNG)"** button (top controls row) renders a single styled
@@ -136,6 +158,28 @@ Bluetooth/Wi-Fi ISM band, and AM broadcast band) and 1 marginal pass.
   that exists in the PDF; if your report is a scanned image with no text
   layer, extraction will find nothing. You'd need to OCR it first (e.g.
   with `ocrmypdf`) before uploading.
+- **Individual image-embedded tables within an otherwise text-based
+  report** (seen in the wild: a lab that renders its "Tabular summary of
+  CE 420" page as a screenshot rather than real text) are detected and
+  flagged — the app looks for a table heading with no extractable data
+  following it. This is surfaced explicitly wherever results are shown:
+  a banner on the Overview tab, a detail table on the Debug tab, an inline
+  "⚠ N page(s) for this test couldn't be read" warning on the relevant
+  RE310/CE420 (or other) group in the Failures and Band Summary tabs, and
+  a warning banner plus per-section notes in the exported PNG Summary — so
+  a low or zero failure count for that test is never mistaken for "clean"
+  when the underlying data actually couldn't be read. The underlying data
+  still can't be read, though; check that page in the source PDF directly.
+- **Non-measurement text is filtered out of the generic emissions
+  parser**, but this is inherently heuristic: page headers/footers, table-
+  of-contents entries, settings/methodology tables, and "X MHz to Y MHz"
+  range-description sentences are recognized and excluded (this was tuned
+  against several real reports and is covered by
+  `tests/falsePositives.test.js`), and the generic parser no longer runs
+  inside immunity-type sections at all (that has its own dedicated
+  extraction). If you spot a fabricated result anywhere, please flag the
+  exact source line — that's exactly the kind of case this test file is
+  meant to grow to cover.
 - **Column-order assumption.** When 3 numeric dB-style values appear in a
   row, the parser assumes they are `[level, limit, margin]` in that order,
   which matches the most common layout but isn't guaranteed.
@@ -180,6 +224,7 @@ emc-report-analyzer/
 │   ├── pdfExtract.js      # pdf.js text extraction + row reconstruction
 │   ├── parser.js          # section detection, row parsing, pass/fail logic
 │   ├── bandData.js         # radio service band reference table
+│   ├── jlrLimits.js        # JLR-EMC-CS v1.0 Amd.4 RE310/CE420 limit tables + lookup
 │   ├── csvExport.js        # CSV export helper
 │   └── app.js               # UI wiring
 ├── sample/
@@ -190,7 +235,10 @@ emc-report-analyzer/
 │   ├── generate_sample_report.py
 │   ├── generate_sample_narrative_report.py
 │   └── generate_sample_immunity_report.py
-├── tests/pipeline.test.js  # Node end-to-end test
+├── tests/
+│   ├── pipeline.test.js       # Node end-to-end test (3 synthetic sample PDFs)
+│   ├── jlrLimits.test.js      # locks in the JLR-EMC-CS limit numbers
+│   └── falsePositives.test.js # regression test for fabricated-result bugs
 └── README.md
 ```
 

@@ -4,7 +4,7 @@
   "private": true,
   "description": "Client-side web app that parses EMC test report PDFs and summarizes failures / out-of-limit emissions by radio band.",
   "scripts": {
-    "test": "node tests/pipeline.test.js"
+    "test": "node tests/jlrLimits.test.js && node tests/falsePositives.test.js && node tests/pipeline.test.js"
   },
   "devDependencies": {
     "pdfjs-dist": "3.11.174"

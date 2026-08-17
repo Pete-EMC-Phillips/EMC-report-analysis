@@ -142,6 +142,8 @@
     const marginal = results.filter((r) => r.marginal);
     const passes = results.filter((r) => r.exceed === false && !r.marginal);
     const unknown = results.filter((r) => r.exceed === null);
+    const re310Fails = fails.filter((r) => JlrLimits.testTypeForSection(r.section) === "RE310");
+    const ce420Fails = fails.filter((r) => JlrLimits.testTypeForSection(r.section) === "CE420");
 
     const statBox = (label, value, cls) =>
       `<div class="stat-box ${cls || ""}"><div class="value">${value}</div><div class="label">${label}</div></div>`;
@@ -149,7 +151,8 @@
     $("#overview-stats").innerHTML =
       statBox("Pages analyzed", state.totalPages) +
       statBox("Emissions data rows found", results.length) +
-      statBox("Emissions failures / over limit", fails.length, "fail") +
+      statBox("RE 310 failures", re310Fails.length, re310Fails.length ? "fail" : "pass") +
+      statBox("CE 420 failures", ce420Fails.length, ce420Fails.length ? "fail" : "pass") +
       statBox("Marginal (near limit)", marginal.length, "marginal") +
       statBox("Emissions pass", passes.length, "pass") +
       statBox("Unclear result", unknown.length);
@@ -166,6 +169,14 @@
         failedCats.length ? " Failing: " + failedCats.map((s) => s.code).join(", ") : ""
       }</p>`;
     }
+
+    const imageOnly = state.analysis.imageOnlyTables || [];
+    if (imageOnly.length) {
+      html += `<p class="jlr-mismatch">&#9888; ${imageOnly.length} page${imageOnly.length === 1 ? "" : "s"} contain a results table this tool couldn't read (likely embedded as an image rather than text): ${imageOnly
+        .map((t) => `p.${t.page} (${escapeHtml(t.testCode)})`)
+        .join(", ")}. Check these pages directly in the source PDF - see the Debug tab for details.</p>`;
+    }
+
     standardsEl.innerHTML = html;
 
     renderBandChart(fails);
@@ -245,49 +256,217 @@
     return parts.join(" · ") || "—";
   }
 
+  // ---- JLR-EMC-CS RE310/CE420 cross-check ---------------------------------
+
+  // Returns { html, csvBand, csvLimit, csvDiff } for the JLR-EMC-CS column:
+  // which standard band(s) this frequency falls in, their limit(s), and
+  // whether the report's own stated limit (r.limit) disagrees with the
+  // standard by more than a small rounding tolerance.
+  function jlrCrossCheck(r) {
+    const testType = JlrLimits.testTypeForSection(r.section);
+    if (!testType) return { html: '<span class="hint">—</span>', csvBand: "", csvLimit: "", csvDiff: "" };
+
+    const matches = JlrLimits.lookup(testType, r.frequencyMHz, r.detector);
+    if (!matches.length) {
+      return { html: '<span class="hint">no JLR-EMC-CS band</span>', csvBand: "", csvLimit: "", csvDiff: "" };
+    }
+
+    const TOL_DB = 0.5;
+    let anyMismatch = false;
+    const csvParts = [];
+    const csvLimits = [];
+    const diffs = [];
+
+    const partsHtml = matches.map((band) => {
+      csvParts.push(band.id);
+      const entriesHtml = band.entries
+        .map((e) => {
+          csvLimits.push(`${e.detector} ${e.limit}`);
+          let cls = e.matchesReportDetector ? "jlr-matched-detector" : "";
+          let extra = "";
+          if (e.matchesReportDetector && typeof r.limit === "number") {
+            const diff = round1(r.limit - e.limit);
+            diffs.push(diff);
+            if (Math.abs(diff) > TOL_DB) {
+              anyMismatch = true;
+              extra = ` <span class="jlr-mismatch" title="Report states ${r.limit} ${band.unit}, standard says ${e.limit} ${band.unit} at this frequency">⚠ report ${r.limit} vs std ${e.limit}</span>`;
+            }
+          }
+          return `<span class="${cls}">${e.detector} ${e.limit}</span>${extra}`;
+        })
+        .join(" · ");
+      return `<strong>${escapeHtml(band.id)}</strong> <span class="hint">${escapeHtml(band.desc)}</span><br>${entriesHtml}`;
+    });
+
+    return {
+      html: partsHtml.join('<hr class="jlr-band-sep">'),
+      csvBand: csvParts.join("; "),
+      csvLimit: csvLimits.join("; "),
+      csvDiff: diffs.length ? diffs.join("; ") : "",
+      mismatch: anyMismatch,
+    };
+  }
+
+  function round1(n) {
+    return Math.round(n * 10) / 10;
+  }
+
+  // Classifies an imageOnlyTables entry's testCode ("RE 310", "CE 420",
+  // "RE 320", ...) into the same RE310/CE420/OTHER buckets used elsewhere,
+  // so "this test's table was an unreadable image" warnings can be shown
+  // right alongside that test's results.
+  function classifyTestCode(testCode) {
+    const t = (testCode || "").replace(/\s+/g, "").toUpperCase();
+    if (t.startsWith("RE310")) return "RE310";
+    if (t.startsWith("CE420")) return "CE420";
+    return "OTHER";
+  }
+
+  function imageOnlyForTestType(testType) {
+    const all = (state.analysis && state.analysis.imageOnlyTables) || [];
+    return all.filter((t) => classifyTestCode(t.testCode) === testType);
+  }
+
+  // Explicit "this data isn't readable" warning for a given test type, shown
+  // inline wherever that test's results are presented - so a low/zero
+  // failure count is never mistaken for a clean pass when the source table
+  // was actually an unreadable embedded image.
+  function imageOnlyWarningHtml(testType) {
+    const entries = imageOnlyForTestType(testType);
+    if (!entries.length) return "";
+    const pages = entries.map((t) => `p.${t.page}`).join(", ");
+    return `<p class="jlr-mismatch">&#9888; ${entries.length} page${entries.length === 1 ? "" : "s"} for this test could not be read (the results table appears to be embedded as an image, not text): ${pages}. Results shown here may be incomplete for those pages - check them directly in the source PDF.</p>`;
+  }
+
+
+  // Groups failures by JLR-EMC-CS test (RE310 / CE420), with anything else
+  // (RE320, harmonics, flicker, or a report with no JLR section wording at
+  // all) bucketed by its own section label so nothing is silently dropped.
+  // Each group is sorted worst-margin-first, matching how an engineer scans
+  // a report: "is this specific test OK, and if not, what's the worst
+  // point?"
+  function groupFailuresByTest(fails) {
+    const groups = new Map(); // key -> { title, rows: [] }
+    const ensure = (key, title) => {
+      if (!groups.has(key)) groups.set(key, { key, title, rows: [] });
+      return groups.get(key);
+    };
+    // Always show RE310 / CE420 groups even if empty, so it's obvious at a
+    // glance which of the two main tests has a problem and which doesn't.
+    ensure("RE310", "RE 310 — Radiated Emissions");
+    ensure("CE420", "CE 420 — Conducted Emissions");
+
+    for (const r of fails) {
+      const testType = JlrLimits.testTypeForSection(r.section);
+      const group = testType ? ensure(testType, testType === "RE310" ? "RE 310 — Radiated Emissions" : "CE 420 — Conducted Emissions") : ensure(r.section || "other", r.section || "Other");
+      group.rows.push(r);
+    }
+
+    const marginOf = (r) => r.computedMargin ?? r.reportedMargin ?? 0;
+    for (const g of groups.values()) g.rows.sort((a, b) => marginOf(a) - marginOf(b));
+
+    // Order: RE310, CE420, then everything else alphabetically by title -
+    // but drop any "other" group that ended up empty (only RE310/CE420 are
+    // always shown regardless of count).
+    const ordered = [groups.get("RE310"), groups.get("CE420")];
+    const rest = Array.from(groups.values())
+      .filter((g) => g.key !== "RE310" && g.key !== "CE420" && g.rows.length)
+      .sort((a, b) => a.title.localeCompare(b.title));
+    return ordered.concat(rest);
+  }
+
+  function failuresRowHtml(r) {
+    const jlr = jlrCrossCheck(r);
+    return `<tr class="row-fail">
+      <td>${r.page}</td>
+      <td class="wrap">${testFileLabel(r)}</td>
+      <td class="wrap">${r.section}</td>
+      <td>${fmtFreq(r.frequencyMHz)}</td>
+      <td class="wrap">${bandLabel(r.frequencyMHz)}</td>
+      <td>${r.level ?? "—"}</td>
+      <td>${r.limit ?? "—"}</td>
+      <td>${r.computedMargin ?? r.reportedMargin ?? "—"}</td>
+      <td>${r.detector ?? "—"}</td>
+      <td>${resultBadge(r)}</td>
+      <td class="wrap">${jlr.html}</td>
+    </tr>`;
+  }
+
+  function failuresCsvRow(r) {
+    const jlr = jlrCrossCheck(r);
+    return {
+      page: r.page,
+      test: r.testId,
+      file: r.fileRef,
+      antenna: r.antenna,
+      section: r.section,
+      frequencyMHz: r.frequencyMHz,
+      band: bandLabel(r.frequencyMHz),
+      level: r.level,
+      limit: r.limit,
+      margin: r.computedMargin ?? r.reportedMargin,
+      detector: r.detector,
+      result: r.result || (r.exceed ? "FAIL" : ""),
+      jlrBand: jlr.csvBand,
+      jlrLimit: jlr.csvLimit,
+      jlrLimitDiff: jlr.csvDiff,
+      raw: r.raw,
+    };
+  }
+
+  const FAILURES_CSV_HEADERS = ["page", "test", "file", "antenna", "section", "frequencyMHz", "band", "level", "limit", "margin", "detector", "result", "jlrBand", "jlrLimit", "jlrLimitDiff", "raw"];
+
   function renderFailures() {
     const fails = state.analysis.results.filter((r) => r.kind === "emission" && r.exceed === true);
-    $("#failures-count").textContent = `${fails.length} failure${fails.length === 1 ? "" : "s"} found`;
+    const groups = groupFailuresByTest(fails);
 
-    const tbody = $("#failures-table tbody");
-    tbody.innerHTML = fails
-      .map(
-        (r) => `<tr class="row-fail">
-          <td>${r.page}</td>
-          <td class="wrap">${testFileLabel(r)}</td>
-          <td class="wrap">${r.section}</td>
-          <td>${fmtFreq(r.frequencyMHz)}</td>
-          <td class="wrap">${bandLabel(r.frequencyMHz)}</td>
-          <td>${r.level ?? "—"}</td>
-          <td>${r.limit ?? "—"}</td>
-          <td>${r.computedMargin ?? r.reportedMargin ?? "—"}</td>
-          <td>${r.detector ?? "—"}</td>
-          <td>${resultBadge(r)}</td>
-        </tr>`
-      )
+    const container = $("#failures-groups");
+    container.innerHTML = groups
+      .map((g, i) => {
+        const btnId = `export-failures-csv-${g.key}`;
+        const bodyHtml = g.rows.length
+          ? g.rows.map(failuresRowHtml).join("")
+          : `<tr><td colspan="11" class="hint">No failures found for this test.</td></tr>`;
+        const imgWarning = (g.key === "RE310" || g.key === "CE420") ? imageOnlyWarningHtml(g.key) : "";
+        return `<h3${i === 0 ? ' style="margin-top:0"' : ""}>${escapeHtml(g.title)}</h3>
+          ${imgWarning}
+          <div class="table-toolbar">
+            <span>${g.rows.length} failure${g.rows.length === 1 ? "" : "s"}${g.rows.length ? " (worst margin first)" : ""}</span>
+            ${g.rows.length ? `<button id="${btnId}" class="secondary-btn">Export CSV</button>` : ""}
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Radio Band(s)</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th><th>JLR-EMC-CS</th></tr>
+              </thead>
+              <tbody>${bodyHtml}</tbody>
+            </table>
+          </div>`;
+      })
       .join("");
 
-    $("#export-failures-csv").onclick = () => {
-      CsvExport.downloadCsv(
-        "emc_failures.csv",
-        ["page", "test", "file", "antenna", "section", "frequencyMHz", "band", "level", "limit", "margin", "detector", "result", "raw"],
-        fails.map((r) => ({
-          page: r.page,
-          test: r.testId,
-          file: r.fileRef,
-          antenna: r.antenna,
-          section: r.section,
-          frequencyMHz: r.frequencyMHz,
-          band: bandLabel(r.frequencyMHz),
-          level: r.level,
-          limit: r.limit,
-          margin: r.computedMargin ?? r.reportedMargin,
-          detector: r.detector,
-          result: r.result || (r.exceed ? "FAIL" : ""),
-          raw: r.raw,
-        }))
-      );
-    };
+    // RE310/CE420 groups always render (with their own image-only warning
+    // above), and other test sections only render when they have at least
+    // one failure row - but a test whose table was entirely an unreadable
+    // image has zero rows by definition, so it would otherwise vanish
+    // silently. Add a standalone notice for any such test so it's not
+    // mistaken for "no failures found" when really "couldn't be read".
+    const otherImageOnlyForFailures = imageOnlyForTestType("OTHER");
+    if (otherImageOnlyForFailures.length) {
+      const pages = otherImageOnlyForFailures.map((t) => `p.${t.page} (${escapeHtml(t.testCode)})`).join(", ");
+      container.innerHTML += `<h3>Other tests with unreadable data</h3>
+        <p class="jlr-mismatch">&#9888; ${otherImageOnlyForFailures.length} page${otherImageOnlyForFailures.length === 1 ? "" : "s"} contain a results table that could not be read (embedded as an image, not text), so no failures could be extracted from them either way: ${pages}. Check these pages directly in the source PDF - a lack of failures listed here does not mean these tests passed.</p>`;
+    }
+
+    for (const g of groups) {
+      if (!g.rows.length) continue;
+      const btn = $(`#export-failures-csv-${g.key}`);
+      if (!btn) continue;
+      btn.onclick = () => {
+        const safeKey = g.key.replace(/[^\w\-]+/g, "_").toLowerCase();
+        CsvExport.downloadCsv(`emc_failures_${safeKey}.csv`, FAILURES_CSV_HEADERS, g.rows.map(failuresCsvRow));
+      };
+    }
   }
 
   // ---- Rendering: Band Summary --------------------------------------------
@@ -303,10 +482,20 @@
   }
 
   // Pure data computation (no DOM), shared by the Band Summary tab and the
-  // "Export Summary" button.
-  function computeBandSummaryRows(includeMarginal) {
+  // "Export Summary" button. testType, if given ('RE310' | 'CE420'),
+  // restricts to results belonging to that JLR-EMC-CS test - RE310 (field
+  // strength, dBµV/m) and CE420 (current, dBµA) aren't comparable
+  // measurements even when they nominally cover the same radio-service
+  // band, so mixing their margins into one "worst" figure would be
+  // misleading.
+  function computeBandSummaryRows(includeMarginal, testType) {
+    const matchesTestType = (r) => {
+      if (!testType) return true;
+      const t = JlrLimits.testTypeForSection(r.section);
+      return testType === "OTHER" ? t === null : t === testType;
+    };
     const relevant = state.analysis.results.filter(
-      (r) => r.kind === "emission" && (r.exceed === true || (includeMarginal && r.marginal))
+      (r) => r.kind === "emission" && (r.exceed === true || (includeMarginal && r.marginal)) && matchesTestType(r)
     );
 
     const byBand = new Map(); // bandName -> entries[]
@@ -347,27 +536,84 @@
     return rows;
   }
 
+  const BAND_SUMMARY_CSV_HEADERS = ["band", "rangeMHz", "exceedances", "worstMarginDb", "worstPage", "worstPageLabel", "frequencies", "pages"];
+
+  function bandSummaryRowHtml(row) {
+    const worstPageCell =
+      row.worstPage !== null
+        ? `<strong>p. ${row.worstPage}</strong>${row.worstLabel ? `<br><span class="hint">${row.worstLabel}</span>` : ""}`
+        : "—";
+    return `<tr class="${row.hasFail ? "row-fail" : "row-marginal"}">
+      <td class="wrap">${row.bandName}</td>
+      <td>${row.rangeLabel}</td>
+      <td>${row.count}</td>
+      <td>${row.worstMargin ?? "—"}</td>
+      <td class="wrap">${worstPageCell}</td>
+      <td class="wrap">${row.freqs.join(", ")}</td>
+      <td class="wrap">${row.pages.join(", ")}</td>
+    </tr>`;
+  }
+
+  function bandSummaryCsvRow(row) {
+    return {
+      band: row.bandName,
+      rangeMHz: row.rangeLabel,
+      exceedances: row.count,
+      worstMarginDb: row.worstMargin ?? "",
+      worstPage: row.worstPage ?? "",
+      worstPageLabel: row.worstLabel,
+      frequencies: row.freqs.join("; "),
+      pages: row.pages.join("; "),
+    };
+  }
+
+  function renderBandSummaryGroup(title, key, rows, testType) {
+    const bodyHtml = rows.length
+      ? rows.map(bandSummaryRowHtml).join("")
+      : `<tr><td colspan="7" class="hint">No over-limit results found for this test.</td></tr>`;
+    const imgWarning = testType ? imageOnlyWarningHtml(testType) : "";
+    return `<h3>${escapeHtml(title)}</h3>
+      ${imgWarning}
+      <div class="table-toolbar">
+        <span>${rows.length} band${rows.length === 1 ? "" : "s"} with an exceedance</span>
+        ${rows.length ? `<button id="export-bands-csv-${key}" class="secondary-btn">Export CSV</button>` : ""}
+      </div>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr><th>Radio Band</th><th>Range (MHz)</th><th>Exceedances</th><th>Worst Margin (dB)</th><th>Worst Page</th><th>Frequencies</th><th>Pages</th></tr>
+          </thead>
+          <tbody>${bodyHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
   function renderBandSummary() {
     const includeMarginal = $("#include-marginal-bands").checked;
-    const rows = computeBandSummaryRows(includeMarginal);
+    const groups = [
+      { key: "re310", title: "RE 310 — Radiated Emissions", rows: computeBandSummaryRows(includeMarginal, "RE310"), testType: "RE310" },
+      { key: "ce420", title: "CE 420 — Conducted Emissions", rows: computeBandSummaryRows(includeMarginal, "CE420"), testType: "CE420" },
+    ];
+    // Anything outside RE310/CE420 (RE320 magnetic field emissions,
+    // harmonics, flicker, or a report that doesn't use JLR-EMC-CS section
+    // wording at all) still needs somewhere to show up - only add this
+    // group when it actually has something, unlike RE310/CE420 which are
+    // always shown so it's obvious at a glance which of the two main tests
+    // is clean.
+    const otherRows = computeBandSummaryRows(includeMarginal, "OTHER");
+    if (otherRows.length || imageOnlyForTestType("OTHER").length)
+      groups.push({ key: "other", title: "Other emissions tests", rows: otherRows, testType: "OTHER" });
 
-    const rowsHtml = rows.map((row) => {
-      const worstPageCell =
-        row.worstPage !== null
-          ? `<strong>p. ${row.worstPage}</strong>${row.worstLabel ? `<br><span class="hint">${row.worstLabel}</span>` : ""}`
-          : "—";
-      return `<tr class="${row.hasFail ? "row-fail" : "row-marginal"}">
-        <td class="wrap">${row.bandName}</td>
-        <td>${row.rangeLabel}</td>
-        <td>${row.count}</td>
-        <td>${row.worstMargin ?? "—"}</td>
-        <td class="wrap">${worstPageCell}</td>
-        <td class="wrap">${row.freqs.join(", ")}</td>
-        <td class="wrap">${row.pages.join(", ")}</td>
-      </tr>`;
-    });
+    $("#bands-groups").innerHTML = groups.map((g) => renderBandSummaryGroup(g.title, g.key, g.rows, g.testType)).join("");
 
-    $("#bands-table tbody").innerHTML = rowsHtml.join("") || `<tr><td colspan="7">No over-limit results found.</td></tr>`;
+    for (const g of groups) {
+      if (!g.rows.length) continue;
+      const btn = $(`#export-bands-csv-${g.key}`);
+      if (!btn) continue;
+      btn.onclick = () => {
+        CsvExport.downloadCsv(`emc_band_summary_${g.key}.csv`, BAND_SUMMARY_CSV_HEADERS, g.rows.map(bandSummaryCsvRow));
+      };
+    }
   }
 
   $("#include-marginal-bands").addEventListener("change", renderBandSummary);
@@ -382,8 +628,9 @@
     const pageRows = results.slice(start, start + state.allResultsPageSize);
 
     $("#all-table tbody").innerHTML = pageRows
-      .map(
-        (r) => `<tr class="${r.exceed === true ? "row-fail" : r.marginal ? "row-marginal" : ""}">
+      .map((r) => {
+        const jlr = jlrCrossCheck(r);
+        return `<tr class="${r.exceed === true ? "row-fail" : r.marginal ? "row-marginal" : ""}">
           <td>${r.page}</td>
           <td class="wrap">${testFileLabel(r)}</td>
           <td class="wrap">${r.section}</td>
@@ -393,8 +640,9 @@
           <td>${r.computedMargin ?? r.reportedMargin ?? "—"}</td>
           <td>${r.detector ?? "—"}</td>
           <td>${resultBadge(r)}</td>
-        </tr>`
-      )
+          <td class="wrap">${jlr.html}</td>
+        </tr>`;
+      })
       .join("");
 
     const totalPages = Math.max(1, Math.ceil(results.length / state.allResultsPageSize));
@@ -403,21 +651,27 @@
     $("#export-all-csv").onclick = () => {
       CsvExport.downloadCsv(
         "emc_all_results.csv",
-        ["page", "test", "file", "antenna", "section", "frequencyMHz", "level", "limit", "margin", "detector", "result", "raw"],
-        results.map((r) => ({
-          page: r.page,
-          test: r.testId,
-          file: r.fileRef,
-          antenna: r.antenna,
-          section: r.section,
-          frequencyMHz: r.frequencyMHz,
-          level: r.level,
-          limit: r.limit,
-          margin: r.computedMargin ?? r.reportedMargin,
-          detector: r.detector,
-          result: r.result || (r.exceed === true ? "FAIL" : r.exceed === false ? "PASS" : ""),
-          raw: r.raw,
-        }))
+        ["page", "test", "file", "antenna", "section", "frequencyMHz", "level", "limit", "margin", "detector", "result", "jlrBand", "jlrLimit", "jlrLimitDiff", "raw"],
+        results.map((r) => {
+          const jlr = jlrCrossCheck(r);
+          return {
+            page: r.page,
+            test: r.testId,
+            file: r.fileRef,
+            antenna: r.antenna,
+            section: r.section,
+            frequencyMHz: r.frequencyMHz,
+            level: r.level,
+            limit: r.limit,
+            margin: r.computedMargin ?? r.reportedMargin,
+            detector: r.detector,
+            result: r.result || (r.exceed === true ? "FAIL" : r.exceed === false ? "PASS" : ""),
+            jlrBand: jlr.csvBand,
+            jlrLimit: jlr.csvLimit,
+            jlrLimitDiff: jlr.csvDiff,
+            raw: r.raw,
+          };
+        })
       );
     };
   }
@@ -574,8 +828,20 @@
   // ---- Rendering: Debug ---------------------------------------------------
 
   function renderDebug() {
-    const { unmatchedCount, sampleUnmatched } = state.analysis;
-    $("#debug-stats").innerHTML = `<p>${unmatchedCount.toLocaleString()} line(s) containing digits did not match a known row pattern (showing up to ${sampleUnmatched.length}).</p>`;
+    const { unmatchedCount, sampleUnmatched, imageOnlyTables } = state.analysis;
+    let statsHtml = `<p>${unmatchedCount.toLocaleString()} line(s) containing digits did not match a known row pattern (showing up to ${sampleUnmatched.length}).</p>`;
+    if (imageOnlyTables && imageOnlyTables.length) {
+      statsHtml += `<p><strong>${imageOnlyTables.length} likely image-embedded table${imageOnlyTables.length === 1 ? "" : "s"}:</strong> a results-table heading was found on these pages but no extractable data followed it - the table is probably a raster image (a screenshot of a spreadsheet, for example) rather than real text, which this tool can't read. Open the page directly in the PDF to check it by eye.</p>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>Page</th><th>Test</th><th>Heading found</th></tr></thead>
+            <tbody>${imageOnlyTables
+              .map((t) => `<tr class="row-marginal"><td>${t.page}</td><td>${escapeHtml(t.testCode)}</td><td class="wrap">${escapeHtml(t.heading)}</td></tr>`)
+              .join("")}</tbody>
+          </table>
+        </div>`;
+    }
+    $("#debug-stats").innerHTML = statsHtml;
     $("#debug-table tbody").innerHTML = sampleUnmatched
       .map((r) => `<tr><td>${r.page}</td><td class="wrap">${escapeHtml(r.text)}</td></tr>`)
       .join("");
@@ -609,6 +875,15 @@
     const marginal = results.filter((r) => r.marginal);
     const passes = results.filter((r) => r.exceed === false && !r.marginal);
     const unknown = results.filter((r) => r.exceed === null);
+    const re310Fails = fails.filter((r) => JlrLimits.testTypeForSection(r.section) === "RE310");
+    const ce420Fails = fails.filter((r) => JlrLimits.testTypeForSection(r.section) === "CE420");
+
+    const imageOnlyAll = state.analysis.imageOnlyTables || [];
+    const imageOnlyBannerHtml = imageOnlyAll.length
+      ? `<div class="es-warning-banner">&#9888; ${imageOnlyAll.length} page${imageOnlyAll.length === 1 ? "" : "s"} in this report contain a results table that could not be read as data - it is likely embedded as an image (e.g. a screenshot of a spreadsheet), not text: ${imageOnlyAll
+          .map((t) => `p.${t.page} (${escapeHtml(t.testCode)})`)
+          .join(", ")}. Do not read a low/zero failure count below as "clean" for these pages - check them directly in the source PDF.</div>`
+      : "";
 
     const statHtml = (label, value, cls) =>
       `<div class="es-stat ${cls || ""}"><div class="es-stat-value">${value}</div><div class="es-stat-label">${escapeHtml(label)}</div></div>`;
@@ -624,24 +899,33 @@
         }.</p>`
       : "";
 
-    // Band Summary
+    // Band Summary - split by test (RE310 field strength vs CE420 current
+    // aren't comparable, so they never share a "worst" figure).
     const includeMarginal = $("#include-marginal-bands").checked;
-    const bandRows = computeBandSummaryRows(includeMarginal);
-    const bandTable = esTable(
-      ["Radio Band", "Range (MHz)", "Exceedances", "Worst Margin (dB)", "Worst Page", "Frequencies"],
-      bandRows.map((row) => [
-        escapeHtml(row.bandName),
-        escapeHtml(row.rangeLabel),
-        String(row.count),
-        row.worstMargin ?? "—",
-        row.worstPage !== null
-          ? `<strong>p. ${row.worstPage}</strong>${row.worstLabel && row.worstLabel !== "—" ? `<br><span style="color:#6b7280;font-size:0.72rem">${escapeHtml(row.worstLabel)}</span>` : ""}`
-          : "—",
-        escapeHtml(row.freqs.slice(0, 5).join(", ")),
-      ]),
-      (i) => (bandRows[i].hasFail ? "row-fail" : "row-marginal"),
-      "No over-limit results found."
-    );
+    const bandTableFor = (testType) => {
+      const bandRows = computeBandSummaryRows(includeMarginal, testType);
+      return esTable(
+        ["Radio Band", "Range (MHz)", "Exceedances", "Worst Margin (dB)", "Worst Page", "Frequencies"],
+        bandRows.map((row) => [
+          escapeHtml(row.bandName),
+          escapeHtml(row.rangeLabel),
+          String(row.count),
+          row.worstMargin ?? "—",
+          row.worstPage !== null
+            ? `<strong>p. ${row.worstPage}</strong>${row.worstLabel && row.worstLabel !== "—" ? `<br><span style="color:#6b7280;font-size:0.72rem">${escapeHtml(row.worstLabel)}</span>` : ""}`
+            : "—",
+          escapeHtml(row.freqs.slice(0, 5).join(", ")),
+        ]),
+        (i) => (bandRows[i].hasFail ? "row-fail" : "row-marginal"),
+        "No over-limit results found for this test."
+      );
+    };
+    const re310BandTable = bandTableFor("RE310");
+    const ce420BandTable = bandTableFor("CE420");
+    const otherBandRows = computeBandSummaryRows(includeMarginal, "OTHER");
+    const otherImageOnly = imageOnlyForTestType("OTHER");
+    const showOtherSection = otherBandRows.length > 0 || otherImageOnly.length > 0;
+    const otherBandTable = showOtherSection ? bandTableFor("OTHER") : "";
 
     // Immunity
     const immunityAll = state.analysis.results.filter((r) => r.kind === "immunity");
@@ -670,12 +954,14 @@
         </div>
         <div class="es-body">
           <p class="es-disclaimer">Generated by EMC Test Report Analyzer using heuristic text parsing. Always verify flagged results against the source PDF page before making a compliance decision.</p>
+          ${imageOnlyBannerHtml}
 
           <div class="es-section">
             <h2>Overview</h2>
             <div class="es-stats-grid">
               ${statHtml("Emissions rows found", results.length)}
-              ${statHtml("Failures / over limit", fails.length, "fail")}
+              ${statHtml("RE 310 failures", re310Fails.length, re310Fails.length ? "fail" : "pass")}
+              ${statHtml("CE 420 failures", ce420Fails.length, ce420Fails.length ? "fail" : "pass")}
               ${statHtml("Marginal (near limit)", marginal.length, "marginal")}
               ${statHtml("Emissions pass", passes.length, "pass")}
               ${statHtml("Unclear result", unknown.length)}
@@ -685,10 +971,27 @@
           </div>
 
           <div class="es-section">
-            <h2>Band Summary</h2>
-            <p class="es-note">Radio-service bands with at least one over-limit measurement${includeMarginal ? " (including marginal results)" : ""}.</p>
-            ${bandTable}
+            <h2>Band Summary — RE 310 (Radiated Emissions)</h2>
+            <p class="es-note">Radio-service bands with at least one over-limit RE 310 measurement${includeMarginal ? " (including marginal results)" : ""}.</p>
+            ${imageOnlyWarningHtml("RE310")}
+            ${re310BandTable}
           </div>
+
+          <div class="es-section">
+            <h2>Band Summary — CE 420 (Conducted Emissions)</h2>
+            <p class="es-note">Radio-service bands with at least one over-limit CE 420 measurement${includeMarginal ? " (including marginal results)" : ""}.</p>
+            ${imageOnlyWarningHtml("CE420")}
+            ${ce420BandTable}
+          </div>
+          ${
+            showOtherSection
+              ? `<div class="es-section">
+            <h2>Band Summary — Other Emissions Tests</h2>
+            ${imageOnlyWarningHtml("OTHER")}
+            ${otherBandTable}
+          </div>`
+              : ""
+          }
 
           <div class="es-section">
             <h2>Immunity Failures</h2>
@@ -750,4 +1053,45 @@
   }
 
   $("#export-summary-btn").addEventListener("click", exportSummaryImage);
+
+  // ---- Rendering: Standard reference tab (static, not tied to a report) --
+
+  function renderJlrTable(title, bands, sampleFreq) {
+    const rows = bands
+      .map((b) => {
+        const sample = JlrLimits.lookup(
+          b.table === "8-2" ? "CE420" : "RE310",
+          Math.min(Math.max(sampleFreq(b), b.freqLow), b.freqHigh)
+        ).find((m) => m.id === b.id);
+        const limitsHtml = sample
+          ? sample.entries.map((e) => `${e.detector} ${e.limit} <span class="hint">(${e.bwKHz} kHz)</span>`).join(" · ")
+          : "—";
+        return `<tr>
+          <td><strong>${escapeHtml(b.id)}</strong></td>
+          <td class="wrap">${escapeHtml(b.desc)}</td>
+          <td>${b.freqLow}–${b.freqHigh}</td>
+          <td class="wrap">${limitsHtml}</td>
+        </tr>`;
+      })
+      .join("");
+    return `<h4>${escapeHtml(title)}</h4>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead><tr><th>ID</th><th>Description</th><th>Freq (MHz)</th><th>Limit at band midpoint (formula-based bands vary across the range \u2014 use the app\u2019s cross-check column for the exact value at a specific frequency)</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function renderStandardTab() {
+    const el = $("#standard-tables");
+    if (!el) return;
+    const midOf = (b) => (b.freqLow + b.freqHigh) / 2 || b.freqLow;
+    el.innerHTML =
+      renderJlrTable("Table 7-1 — RE 310 Level 1 (formula bands evaluated at range midpoint)", JlrLimits.RE310_LEVEL1, midOf) +
+      renderJlrTable("Table 7-2 — RE 310 Level 2", JlrLimits.RE310_LEVEL2, midOf) +
+      renderJlrTable("Table 8-2 — CE 420", JlrLimits.CE420_LEVEL, midOf);
+  }
+
+  if (typeof JlrLimits !== "undefined") renderStandardTab();
 })();

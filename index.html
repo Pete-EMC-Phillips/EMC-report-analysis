@@ -67,6 +67,7 @@
         <button class="tab-btn" data-tab="immunity">Immunity</button>
         <button class="tab-btn" data-tab="all">All Results</button>
         <button class="tab-btn" data-tab="debug">Debug</button>
+        <button class="tab-btn" data-tab="standard">Standard</button>
       </nav>
 
       <div id="tab-overview" class="tab-panel card active">
@@ -76,31 +77,14 @@
       </div>
 
       <div id="tab-failures" class="tab-panel card">
-        <div class="table-toolbar">
-          <span id="failures-count"></span>
-          <button id="export-failures-csv" class="secondary-btn">Export CSV</button>
-        </div>
-        <div class="table-scroll">
-          <table id="failures-table" class="data-table">
-            <thead>
-              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Radio Band(s)</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <p class="hint">Failures are grouped by test (RE 310 / CE 420 / other), worst margin first, so you can see at a glance whether each individual test has a problem. The "JLR-EMC-CS" column cross-checks Radiated (RE 310) / Conducted (CE 420) rows against the exact limit lines in JLR-EMC-CS v1.0 Amendment 4 (Tables 7-1, 7-2, 8-2) — see the Standard tab for details and limitations.</p>
+        <div id="failures-groups"></div>
       </div>
 
       <div id="tab-bands" class="tab-panel card">
-        <p class="hint">Radio-service bands with at least one measurement over the limit (or, if toggled, within the marginal threshold). Band edges are indicative reference data — see README for details.</p>
+        <p class="hint">Radio-service bands with at least one measurement over the limit (or, if toggled, within the marginal threshold), split by test — RE 310 (field strength, dBµV/m) and CE 420 (current, dBµA) aren't comparable measurements, so they're never combined into one "worst" figure even when they cover the same nominal band. Band edges are indicative reference data — see README for details.</p>
         <label><input type="checkbox" id="include-marginal-bands" /> Include marginal results in band summary</label>
-        <div class="table-scroll">
-          <table id="bands-table" class="data-table">
-            <thead>
-              <tr><th>Radio Band</th><th>Range (MHz)</th><th>Exceedances</th><th>Worst Margin (dB)</th><th>Worst Page</th><th>Frequencies</th><th>Pages</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div id="bands-groups"></div>
       </div>
 
       <div id="tab-immunity" class="tab-panel card">
@@ -156,7 +140,7 @@
         <div class="table-scroll">
           <table id="all-table" class="data-table">
             <thead>
-              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th></tr>
+              <tr><th>Page</th><th>Test / File</th><th>Section</th><th>Frequency</th><th>Level</th><th>Limit</th><th>Margin (dB)</th><th>Detector</th><th>Result</th><th>JLR-EMC-CS</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -166,6 +150,12 @@
           <span id="all-page-label"></span>
           <button id="all-next" class="secondary-btn">Next &raquo;</button>
         </div>
+      </div>
+
+      <div id="tab-standard" class="tab-panel card">
+        <h3>JLR-EMC-CS v1.0 Amendment 4 — RE 310 &amp; CE 420 Limits</h3>
+        <p class="hint">Reference limit lines used for the "JLR-EMC-CS" cross-check column on the Failures and All Results tabs, transcribed directly from the standard (Tables 7-1, 7-2 and 8-2). Frequency-dependent (log-formula) limits are shown as their formula; flat limits are shown as a single value. This is a cross-check aid, not a substitute for reading the actual standard — always verify against the source document for anything compliance-critical. Coverage is currently limited to RE 310 and CE 420; other tests (immunity, CE 410, RE 320, etc.) are not yet cross-checked against numeric limits.</p>
+        <div id="standard-tables"></div>
       </div>
 
       <div id="tab-debug" class="tab-panel card">
@@ -189,6 +179,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="js/bandData.js"></script>
+  <script src="js/jlrLimits.js"></script>
   <script src="js/parser.js"></script>
   <script src="js/pdfExtract.js"></script>
   <script src="js/csvExport.js"></script>

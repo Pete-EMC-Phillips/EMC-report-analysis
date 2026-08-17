@@ -43,6 +43,16 @@
     { key: "magnetic_field", label: "Magnetic Field Immunity", re: /magnetic\s+field\s+immunity/i },
   ];
 
+  const IMMUNITY_SECTION_KEYS = new Set([
+    "radiated_immunity",
+    "conducted_immunity",
+    "esd",
+    "eft_burst",
+    "surge",
+    "dips_interruptions",
+    "magnetic_field",
+  ]);
+
   function detectSection(line) {
     for (const p of SECTION_PATTERNS) {
       if (p.re.test(line)) return { key: p.key, label: p.label };
@@ -78,6 +88,7 @@
     return text.replace(BOILERPLATE_RE, " ").replace(/\s+/g, " ").trim();
   }
 
+
   // ---- Narrative exceedance sentences -------------------------------------
   //
   // Some labs (notably automotive CISPR 25 / RE 310-style reports produced by
@@ -108,6 +119,33 @@
   // "BW: 1000 kHz" or "T: 500 ms" contain unit-tagged numbers that aren't
   // frequencies or levels at all).
   const PROSE_LABEL_RE = /^(Settings|Antenna|File|Modification|Result|Limits?\s+according|Investigation|EOP|DUT)\b\s*[:.]?/i;
+
+  // Methodology/spec sentences that describe a tested frequency RANGE
+  // ("FREQUENCY RANGE ... 0.15 MHz to 242 MHz") rather than a single
+  // measurement point. The literal "X <unit> to Y <unit>" phrasing is the
+  // tell - a real tabular data row lists level/limit/margin as separate
+  // adjacent columns, it never joins two frequencies with the word "to".
+  // Left unguarded, the generic parser reads the range's end frequency and
+  // the following spec numbers (bandwidth, step size, etc.) as a bogus
+  // level/limit/margin, fabricating a failure that doesn't exist.
+  const FREQ_RANGE_PHRASE_RE = /\d+(\.\d+)?\s*[kMG]?Hz\s+to\s+\d+(\.\d+)?\s*[kMG]?Hz/i;
+
+  // "Tabular summary of CE 420" / "Tabular summary of RE 310" style
+  // headings some labs use to introduce a results table. Some labs embed
+  // that table as a raster image rather than real text (seen in the wild
+  // on EMCC Dr. Rasek reports) - when that happens the heading is the only
+  // text on the page and zero data rows get extracted. Tracking this lets
+  // the UI tell the user "this table exists but couldn't be read" instead
+  // of silently showing nothing.
+  const TABULAR_SUMMARY_HEADING_RE = /Tabular\s+summary\s+of\s+([A-Z]{2}\s?\d{3})/i;
+
+  // Some labs give a single explicit "STATEMENT OF CONFORMITY: compliant /
+  // not compliant" line per test section instead of (or alongside) a
+  // detailed table. It's pure text with no numeric ambiguity, so it's safe
+  // to pick up even when the detailed results table itself is an embedded
+  // image (see TABULAR_SUMMARY_HEADING_RE above) and nothing else on the
+  // page is machine-readable.
+  const STATEMENT_OF_CONFORMITY_RE = /STATEMENT\s+OF\s+CONFORMITY\s*[:\-]?\s*(not\s+compliant|compliant)\b/i;
 
   /**
    * Normalize a lab's result vocabulary to a common status. Handles the
@@ -310,6 +348,10 @@
   const DB_UNIT_RE = /^dB[\wµμ()/.]*$/i; // dB, dBuV/m, dBµV/m, dBm, dB(uV/m), dBµA ...
   const DETECTOR_RE = /^(QP|CISPR-?QP|AVG?|AV|PK|PEAK|RMS)$/i;
   const RESULT_RE = /^(PASS(ED)?|FAIL(ED)?|MARGINAL|MARGIN)$/i;
+  // Radiated emissions tables commonly end each row with a single-letter
+  // antenna polarization column (H = Horizontal, V = Vertical) - a
+  // legitimate, expected token, not stray prose.
+  const POLARIZATION_RE = /^[HV]$/i;
   const NUMBER_RE = /^-?\d+(?:\.\d+)?$/;
   // A number immediately glued to a unit, e.g. "433.92MHz" or "-12.3dBuV/m"
   const NUMBER_WITH_UNIT_RE = /^(-?\d+(?:\.\d+)?)(GHz|MHz|kHz|Hz|dB[\wµμ()/.]*)$/i;
@@ -359,9 +401,32 @@
 
     let freqMHz = null;
     let freqRaw = null;
+    let freqIsAmbiguous = false; // true if freq came from a bare number, not an explicit unit
     const dbValues = []; // {value, unit}
     let detector = null;
     let result = null;
+
+    // Precompute whether this row contains any "stray" word - alphabetic
+    // content that isn't a recognized unit/detector/result token. Table of
+    // contents lines ("6.2 Conducted transient emissions - CE 410 19"),
+    // settings-table rows ("50 mm 50 mm", "0.01 s 0.01 s 120 kHz (Pk/AV)")
+    // and other prose all contain such words; genuine bare-number data rows
+    // (no units printed per cell, e.g. "80  45.2  50  -4.8") don't. This
+    // gates the most permissive fallback below (treating an ambiguous bare
+    // number as the frequency) so it only fires on rows that actually look
+    // like an unlabelled numeric table row, not on prose that merely
+    // happens to contain a couple of numbers.
+    const hasStrayWord = tokens.some((t) => {
+      const stripped = t.replace(/^[(\[{:,]+|[)\]}:,.;]+$/g, "");
+      if (!stripped || !/[a-zA-Z]/.test(stripped)) return false;
+      return (
+        !FREQ_UNIT_RE.test(stripped) &&
+        !DB_UNIT_RE.test(stripped) &&
+        !DETECTOR_RE.test(stripped) &&
+        !RESULT_RE.test(stripped) &&
+        !POLARIZATION_RE.test(stripped)
+      );
+    });
 
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
@@ -401,14 +466,16 @@
         // Bare number with no unit: could be a unitless dB reading (some
         // reports omit the unit after the first column) or the frequency
         // itself if no unit column is used at all.
-        if (freqMHz === null && val >= MIN_FREQ_MHZ && val <= MAX_FREQ_MHZ && dbValues.length === 0) {
-          // Ambiguous - stash as a tentative frequency only if the row
-          // also contains an explicit MHz/GHz unit token elsewhere, OR
-          // we're inside a known emissions section (reduces false positives
-          // from picking up clause numbers / dates elsewhere in the report).
+        if (freqMHz === null && val >= MIN_FREQ_MHZ && val <= MAX_FREQ_MHZ && dbValues.length === 0 && !hasStrayWord) {
+          // Ambiguous - stash as a tentative frequency only if we're inside
+          // a known emissions section AND the row has no stray prose words
+          // (reduces false positives from TOC entries, settings tables and
+          // other non-data text that happens to contain a couple of bare
+          // numbers).
           if (context.section === "radiated_emissions" || context.section === "conducted_emissions") {
             freqMHz = val;
             freqRaw = tok;
+            freqIsAmbiguous = true;
             continue;
           }
         }
@@ -420,6 +487,12 @@
 
     if (freqMHz === null) return null;
     if (dbValues.length === 0 && !result) return null; // not enough signal
+    // An ambiguous (unit-less) frequency guess with zero dB readings is too
+    // weak to trust even if a PASS/FAIL word appears elsewhere on the line -
+    // that combination is exactly what a wrapped page title/heading
+    // fragment looks like (e.g. "...Level 2 Fail" wrapping onto its own
+    // line reads as "frequency 2, result FAIL"), not a real measurement.
+    if (freqIsAmbiguous && dbValues.length === 0) return null;
 
     const level = dbValues[0] ? dbValues[0].value : null;
     const limit = dbValues[1] ? dbValues[1].value : null;
@@ -490,11 +563,15 @@
     const sampleUnmatched = [];
 
     const testSummary = []; // front-matter "Tests to be done and results" dashboard rows
+    const imageOnlyTables = []; // pages with a table heading but zero extractable data
 
     for (const pageNum of pageOrder) {
       const pageRows = pageMap.get(pageNum);
       const pageText = pageRows.map((r) => r.text).join(" ");
       const context = extractPageContext(pageText);
+
+      const tabularHeadingMatch = pageText.match(TABULAR_SUMMARY_HEADING_RE);
+      const resultsBeforeThisPage = results.length;
 
       for (const narrative of extractNarrativeExceedances(pageText, context, marginalThresholdDb)) {
         narrative.page = pageNum;
@@ -513,6 +590,21 @@
       // pages (like currentSection) rather than re-detected per page.
       const codeMatch = stripBoilerplate(pageText).match(TEST_CODE_RE);
       if (codeMatch) currentTestCode = formatTestCode(codeMatch[1]);
+
+      const conformityMatch = pageText.match(STATEMENT_OF_CONFORMITY_RE);
+      if (conformityMatch) {
+        const status = /^not/i.test(conformityMatch[1]) ? "fail" : "pass";
+        testSummary.push({
+          kind: "testSummary",
+          page: pageNum,
+          code: currentTestCode || (tabularHeadingMatch ? tabularHeadingMatch[1].toUpperCase() : "Conformity"),
+          label: "Statement of Conformity",
+          status,
+          exceed: status === "fail",
+          raw: conformityMatch[0],
+        });
+      }
+
       if (currentTestCode && /^(RI|CI|ESD|EFT)/i.test(currentTestCode)) {
         for (const imm of extractImmunityResults(pageText)) {
           results.push({
@@ -566,7 +658,19 @@
         // (e.g. mistaking the end of a swept range for the measurement
         // frequency). Metadata label lines (Settings/Antenna/File/...) are
         // never measurement rows either.
-        if (/\bexceeded\b/i.test(row.text) || PROSE_LABEL_RE.test(row.text.trim())) continue;
+        if (/\bexceeded\b/i.test(row.text) || PROSE_LABEL_RE.test(row.text.trim()) || FREQ_RANGE_PHRASE_RE.test(row.text)) continue;
+
+        // The generic frequency/level/limit/margin parser below is built
+        // for emissions-style tables. Immunity-type sections (RF/coupled
+        // immunity, ESD, EFT, surge, dips, magnetic field immunity) have
+        // their own dedicated extraction (extractImmunityResults) and often
+        // contain limit-formula / frequency-range spec tables (e.g. RI 140's
+        // "180-20xlog(f/100)") that look superficially like emissions data
+        // but aren't - running them through here fabricates nonsense
+        // failures (seen in the wild: a -786 dB "failure" from a magnetic
+        // field immunity limit formula). Skip the generic parser entirely
+        // once we're inside a known immunity-type section.
+        if (currentSection && IMMUNITY_SECTION_KEYS.has(currentSection.key)) continue;
 
         const parsed = parseRow(row.text, { section: currentSection && currentSection.key });
         if (!parsed) {
@@ -593,6 +697,14 @@
 
         results.push(parsed);
       }
+
+      if (tabularHeadingMatch && results.length === resultsBeforeThisPage) {
+        imageOnlyTables.push({
+          page: pageNum,
+          testCode: tabularHeadingMatch[1].toUpperCase().replace(/\s+/, " "),
+          heading: tabularHeadingMatch[0],
+        });
+      }
     }
 
     return {
@@ -601,6 +713,7 @@
       standardsSeen: Array.from(standardsSeen),
       unmatchedCount,
       sampleUnmatched,
+      imageOnlyTables,
     };
   }
 
